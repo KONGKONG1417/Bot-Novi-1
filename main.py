@@ -1,13 +1,14 @@
-# main.py
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
-from discord.ui import View, Button, Modal, TextInput
-from datetime import datetime, timedelta
-import asyncio
+from discord.ui import Modal, TextInput, View, Button
+from datetime import datetime, timedelta, timezone
 import os
 import re
+import asyncio
+import json
 
+# -------- Intents --------
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -15,16 +16,15 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
-# -----------------------
-# Configs in-memory (simple)
-# -----------------------
-# config_channel: ที่ใช้ตั้งค่า (ห้องเซ็ตบอท)
-# auction_channel: ห้องที่จะโพสต์ประมูลจริง
-# draft: ข้อมูล Embed ที่ออกแบบในห้องเซ็ตบอท (หนึ่งชุด)
+# -------- Configs --------
+CONFIG_FILE = "auction_config.json"
+AUCTION_FILE = "auctions.json"
+
 config = {
     "setup_channel_id": None,
     "auction_channel_id": None,
 }
+
 draft = {
     "title": None,
     "description": None,
@@ -32,49 +32,80 @@ draft = {
     "footer": None,
     "thumbnail": None,
     "image": None,
-    "min_bid": 10000,   # ค่าเริ่มต้น
-    "end_time": None    # datetime
+    "min_bid": 10000,
+    "end_time": None
 }
-auctions = {}  # message_id -> auction dict
 
-# -----------------------
-# Helpers
-# -----------------------
+auctions = {}  # message_id -> auction data
+
+# -------- Data Persistence --------
+def load_config():
+    global config
+    try:
+        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+    except FileNotFoundError:
+        save_config()
+
+def save_config():
+    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+        json.dump(config, f, indent=2)
+
+def load_auctions():
+    global auctions
+    try:
+        with open(AUCTION_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            for msg_id, auction in data.items():
+                auction["end_time"] = datetime.fromisoformat(auction["end_time"])
+                auctions[int(msg_id)] = auction
+    except FileNotFoundError:
+        pass
+
+def save_auctions():
+    data = {}
+    for msg_id, auction in auctions.items():
+        auction_copy = auction.copy()
+        auction_copy["end_time"] = auction["end_time"].isoformat()
+        data[str(msg_id)] = auction_copy
+    with open(AUCTION_FILE, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2)
+
+# -------- Helpers --------
 def parse_time_input(text: str) -> datetime:
-    """
-    รับ text เช่น:
-      - "ถึง12:00" หรือ "12:00"  -> เวลา today หรือ next day ถ้าเวลาแล้ว
-      - "2025-10-30 15:20" -> full datetime (server timezone assumed UTC naive)
-    คืนค่า datetime (UTC naive) หรือ raise ValueError
-    """
-    text = text.strip()
-    # ถ้ามี prefix 'ถึง' เอาออก
-    text = re.sub(r'^(ถึง\s*)', '', text)
-    # ลอง parse full datetime first
-    formats = ["%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M", "%d-%m-%Y %H:%M", "%H:%M"]
+    """แปลงข้อความเป็นเวลา รองรับรูปแบบต่างๆ"""
+    text = re.sub(r'^(ถึง\s*)', '', text.strip())
+    
+    formats = [
+        "%Y-%m-%d %H:%M",
+        "%d-%m-%Y %H:%M",
+        "%H:%M"
+    ]
+    
     for fmt in formats:
         try:
             t = datetime.strptime(text, fmt)
             if fmt == "%H:%M":
-                # ให้เป็น today/time หรือ next day ถ้าเวลาผ่านไปแล้ว
-                now = datetime.utcnow()
-                candidate = datetime(now.year, now.month, now.day, t.hour, t.minute)
-                if candidate <= now:
-                    candidate = candidate + timedelta(days=1)
-                return candidate
+                now = datetime.now(timezone.utc)
+                dt = datetime(now.year, now.month, now.day, t.hour, t.minute, tzinfo=timezone.utc)
+                if dt <= now:
+                    dt += timedelta(days=1)
+                return dt
             else:
-                # full date -> return as-is (assume UTC naive)
-                return t
-        except Exception:
+                return t.replace(tzinfo=timezone.utc)
+        except ValueError:
             continue
-    raise ValueError("รูปแบบเวลาไม่ถูกต้อง — ยอมรับ 'HH:MM' หรือ 'YYYY-MM-DD HH:MM' หรือ 'ถึงHH:MM'")
+    
+    raise ValueError("รูปแบบเวลาไม่ถูกต้อง ใช้: 'HH:MM' หรือ 'YYYY-MM-DD HH:MM'")
 
-def build_preview_embed_from_draft():
+def build_embed_preview():
+    """สร้าง Embed ตัวอย่าง"""
     e = discord.Embed(
         title=draft["title"] or "ตัวอย่างสินค้า",
         description=draft["description"] or "คำอธิบาย",
-        color=int(draft["color"])
+        color=draft["color"]
     )
+    
     if draft.get("thumbnail"):
         e.set_thumbnail(url=draft["thumbnail"])
     if draft.get("image"):
@@ -82,272 +113,418 @@ def build_preview_embed_from_draft():
     if draft.get("footer"):
         e.set_footer(text=draft["footer"])
     if draft.get("end_time"):
-        e.add_field(name="เวลาสิ้นสุด", value=draft["end_time"].strftime("%Y-%m-%d %H:%M UTC"), inline=False)
-    e.add_field(name="ราคาขั้นต่ำ", value=str(draft.get("min_bid", 0)), inline=False)
+        e.add_field(
+            name="เวลาสิ้นสุด", 
+            value=f"<t:{int(draft['end_time'].timestamp())}:F>",
+            inline=False
+        )
+    e.add_field(name="ราคาขั้นต่ำ", value=f"{draft.get('min_bid', 0):,} บาท", inline=False)
+    
     return e
 
-# -----------------------
-# Modal: ตั้งค่า Embed / สร้างประมูล (Mimu-like)
-# -----------------------
-class AuctionSetupModal(Modal):
+# -------- Modal for Basic Info (5 fields max) --------
+class BasicInfoModal(Modal):
     def __init__(self):
-        super().__init__(title="ตั้งค่า Embed ประมูล (Mimu style)")
-        self.title_input = TextInput(label="ชื่อสินค้า / Title", required=True)
-        self.desc_input = TextInput(label="Description", style=discord.TextStyle.paragraph, required=True)
-        self.hex_input = TextInput(label="Hex Color (#RRGGBB)", placeholder="#00ff00", required=True)
-        self.footer_input = TextInput(label="Footer (Optional)", required=False)
-        self.thumb_input = TextInput(label="Thumbnail URL (Optional)", required=False)
-        self.image_input = TextInput(label="Main Image URL (Optional)", required=False)
-        self.minbid_input = TextInput(label="ราคาขั้นต่ำ (ตัวเลข)", placeholder="10000", required=True)
-        self.endtime_input = TextInput(label="เวลาหมด (เช่น 'ถึง12:00' หรือ '2025-10-30 15:20')", required=True)
-        for it in [self.title_input, self.desc_input, self.hex_input, self.footer_input,
-                   self.thumb_input, self.image_input, self.minbid_input, self.endtime_input]:
-            self.add_item(it)
+        super().__init__(title="ตั้งค่าประมูล (1/2)")
+        self.title_input = TextInput(label="ชื่อสินค้า", required=True, max_length=100)
+        self.desc_input = TextInput(
+            label="คำอธิบาย", 
+            style=discord.TextStyle.paragraph, 
+            required=True,
+            max_length=1024
+        )
+        self.hex_input = TextInput(
+            label="สี Hex", 
+            placeholder="#00ff00", 
+            required=False,
+            max_length=7
+        )
+        self.minbid_input = TextInput(
+            label="ราคาขั้นต่ำ", 
+            placeholder="10000", 
+            required=True,
+            max_length=10
+        )
+        self.endtime_input = TextInput(
+            label="เวลาหมด", 
+            placeholder="12:00 หรือ 2025-10-30 15:20",
+            required=True
+        )
+        
+        for item in [self.title_input, self.desc_input, self.hex_input, 
+                     self.minbid_input, self.endtime_input]:
+            self.add_item(item)
 
     async def on_submit(self, interaction: discord.Interaction):
-        # เฉพาะผู้ที่รันคำสั่งใน setup channel เท่านั้น
-        if config["setup_channel_id"] and interaction.channel.id != config["setup_channel_id"]:
-            await interaction.response.send_message("❌ กรุณารันคำสั่งตั้งค่าในห้องที่ตั้งเป็นห้องเซ็ตบอทเท่านั้น", ephemeral=True)
-            return
-
-        # ปรับค่า draft จาก modal
         try:
-            color_s = self.hex_input.value.lstrip("#")
-            color_int = int(color_s, 16)
-        except Exception:
-            await interaction.response.send_message("❌ ค่าสีไม่ถูกต้อง (ต้องเป็น #RRGGBB)", ephemeral=True)
-            return
+            # Validate color
+            if self.hex_input.value:
+                draft["color"] = int(self.hex_input.value.lstrip("#"), 16)
+            
+            # Validate bid
+            draft["min_bid"] = int(re.sub(r'[^\d]', '', self.minbid_input.value))
+            if draft["min_bid"] <= 0:
+                raise ValueError("ราคาต้องมากกว่า 0")
+            
+            # Validate time
+            draft["end_time"] = parse_time_input(self.endtime_input.value)
+            if draft["end_time"] <= datetime.now(timezone.utc):
+                raise ValueError("เวลาต้องเป็นอนาคต")
+            
+            draft["title"] = self.title_input.value
+            draft["description"] = self.desc_input.value
+            
+            await interaction.response.send_message(
+                "✅ บันทึกข้อมูลแล้ว! ใช้ `/ตกแต่งเพิ่ม` เพื่อเพิ่มรูปภาพ (ถ้าต้องการ)",
+                embed=build_embed_preview(),
+                ephemeral=True
+            )
+            
+        except ValueError as e:
+            await interaction.response.send_message(f"❌ ข้อผิดพลาด: {e}", ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"❌ เกิดข้อผิดพลาด: {e}", ephemeral=True)
 
-        try:
-            min_bid = int(re.sub(r'[^\d]', '', self.minbid_input.value))
-        except Exception:
-            await interaction.response.send_message("❌ ราคาขั้นต่ำต้องเป็นตัวเลขเท่านั้น", ephemeral=True)
-            return
+# -------- Modal for Images --------
+class ImageModal(Modal):
+    def __init__(self):
+        super().__init__(title="ตกแต่งรูปภาพ (2/2)")
+        self.footer_input = TextInput(label="Footer", required=False, max_length=100)
+        self.thumb_input = TextInput(label="Thumbnail URL", required=False)
+        self.image_input = TextInput(label="Main Image URL", required=False)
+        
+        for item in [self.footer_input, self.thumb_input, self.image_input]:
+            self.add_item(item)
 
-        # parse end time
-        try:
-            end_dt = parse_time_input(self.endtime_input.value)
-        except Exception as ex:
-            await interaction.response.send_message(f"❌ ไม่สามารถอ่านเวลาได้: {ex}", ephemeral=True)
-            return
-
-        # update draft
-        draft["title"] = self.title_input.value
-        draft["description"] = self.desc_input.value
-        draft["color"] = color_int
+    async def on_submit(self, interaction: discord.Interaction):
         draft["footer"] = self.footer_input.value or None
         draft["thumbnail"] = self.thumb_input.value or None
         draft["image"] = self.image_input.value or None
-        draft["min_bid"] = min_bid
-        draft["end_time"] = end_dt
+        
+        await interaction.response.send_message(
+            "✅ เพิ่มรูปภาพแล้ว!",
+            embed=build_embed_preview(),
+            ephemeral=True
+        )
 
-        # ส่ง preview ในช่อง setup (edit message ถ้ามี)
-        embed = build_preview_embed_from_draft()
-        # send or edit preview
-        await interaction.response.send_message("✅ เซ็ต Embed เสร็จแล้ว — นี่คือตัวอย่าง (เฉพาะในห้องเซ็ตบอท)", embed=embed, ephemeral=True)
-
-# -----------------------
-# Modal: ใส่ราคา (bid)
-# -----------------------
+# -------- Modal for Bidding --------
 class BidModal(Modal):
-    def __init__(self, message_id):
+    def __init__(self, msg_id):
         super().__init__(title="ใส่ราคาประมูล")
-        self.message_id = message_id
-        self.price_input = TextInput(label="ราคา (ตัวเลข)", placeholder="ตัวอย่าง: 15000", required=True)
+        self.msg_id = msg_id
+        self.price_input = TextInput(
+            label="ราคา (บาท)", 
+            placeholder="15000", 
+            required=True,
+            max_length=10
+        )
         self.add_item(self.price_input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)  # ป้องกัน Interaction Failed
-        if self.message_id not in auctions:
-            await interaction.followup.send("❌ ประมูลนี้หาไม่เจอหรือสิ้นสุดแล้ว", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        
+        if self.msg_id not in auctions:
+            await interaction.followup.send("❌ ประมูลนี้จบไปแล้ว", ephemeral=True)
             return
-        auction = auctions[self.message_id]
+        
+        auction = auctions[self.msg_id]
+        
+        # Check if auction ended
+        if datetime.now(timezone.utc) >= auction["end_time"]:
+            await interaction.followup.send("❌ ประมูลหมดเวลาแล้ว", ephemeral=True)
+            return
+        
         try:
             bid = int(re.sub(r'[^\d]', '', self.price_input.value))
-        except Exception:
-            await interaction.followup.send("❌ ใส่ตัวเลขเท่านั้น", ephemeral=True)
+        except ValueError:
+            await interaction.followup.send("❌ กรุณาใส่ตัวเลขเท่านั้น", ephemeral=True)
             return
-
+        
         if bid < auction["min_bid"]:
-            await interaction.followup.send(f"❌ ราคาต้องไม่ต่ำกว่า {auction['min_bid']}", ephemeral=True)
+            await interaction.followup.send(
+                f"❌ ราคาต้องไม่ต่ำกว่า {auction['min_bid']:,} บาท",
+                ephemeral=True
+            )
             return
+        
         if bid <= auction["highest_bid"]:
-            await interaction.followup.send(f"❌ ราคาต้องสูงกว่าราคานำปัจจุบัน {auction['highest_bid']}", ephemeral=True)
+            await interaction.followup.send(
+                f"❌ ราคาต้องมากกว่า {auction['highest_bid']:,} บาท",
+                ephemeral=True
+            )
             return
-
-        # อัปเดตราคานำ
+        
+        # Update auction
         auction["highest_bid"] = bid
         auction["highest_user"] = interaction.user.mention
-        # อัปเดต embed ใน message
+        auction["highest_user_id"] = interaction.user.id
+        save_auctions()
+        
+        # Update embed
         channel = bot.get_channel(auction["channel_id"])
         try:
-            msg = await channel.fetch_message(self.message_id)
-            embed = msg.embeds[0] if msg.embeds else discord.Embed(title=f"ประมูล: {auction['item']}")
-            # update field or replace
+            msg = await channel.fetch_message(self.msg_id)
+            embed = msg.embeds[0]
             embed.clear_fields()
-            embed.add_field(name="ราคานำ", value=f"{auction['highest_bid']} โดย {auction['highest_user']}", inline=False)
-            # keep other visuals by copying from draft stored reference if any
-            # For simplicity, we'll keep title/description/color in auction record
-            embed.title = f"ประมูล: {auction['item']}"
-            embed.color = auction.get("color", 0x00ff00)
+            embed.add_field(
+                name="💰 ราคานำ",
+                value=f"{auction['highest_bid']:,} บาท โดย {auction['highest_user']}",
+                inline=False
+            )
+            embed.add_field(
+                name="⏰ เวลาสิ้นสุด",
+                value=f"<t:{int(auction['end_time'].timestamp())}:R>",
+                inline=False
+            )
             await msg.edit(embed=embed)
-        except Exception:
-            pass
+        except discord.NotFound:
+            await interaction.followup.send("❌ ไม่พบข้อความประมูล", ephemeral=True)
+            return
+        except discord.HTTPException as e:
+            print(f"Error updating embed: {e}")
+        
+        await interaction.followup.send(
+            f"✅ ประมูลสำเร็จ! ราคาของคุณ: {bid:,} บาท",
+            ephemeral=True
+        )
 
-        await interaction.followup.send(f"✅ ประมูลสำเร็จ — ราคาของคุณนำแล้ว {bid}", ephemeral=True)
-
-# -----------------------
-# Views / Buttons
-# -----------------------
+# -------- Persistent View for Auction --------
 class AuctionView(View):
-    def __init__(self, message_id):
+    def __init__(self):
         super().__init__(timeout=None)
-        self.message_id = message_id
 
-    @discord.ui.button(label="ประมูลเพิ่ม 💰", style=discord.ButtonStyle.green)
+    @discord.ui.button(
+        label="ประมูลเพิ่ม 💰",
+        style=discord.ButtonStyle.green,
+        custom_id="auction_bid_button"
+    )
     async def bid_button(self, interaction: discord.Interaction, button: Button):
-        # เปิด modal เก็บราคา
-        await interaction.response.send_modal(BidModal(self.message_id))
+        msg_id = interaction.message.id
+        
+        if msg_id not in auctions:
+            await interaction.response.send_message(
+                "❌ ประมูลนี้จบไปแล้ว",
+                ephemeral=True
+            )
+            return
+        
+        await interaction.response.send_modal(BidModal(msg_id))
 
-# -----------------------
-# Slash Commands (Thai names)
-# -----------------------
-
-# set setup channel (ห้องสำหรับตกแต่ง)
-@tree.command(name="set_setup_channel", description="ตั้งห้องที่ใช้ตกแต่ง/เซ็ตบอท (ห้องเซ็ตบอท)")
-@app_commands.describe(channel="เลือกห้องสำหรับตั้งค่า")
+# -------- Slash Commands --------
+@tree.command(name="set_setup_channel", description="ตั้งห้องเซ็ตบอท")
+@app_commands.describe(channel="เลือกห้องสำหรับตั้งค่าบอท")
 async def set_setup_channel(interaction: discord.Interaction, channel: discord.TextChannel):
     if not interaction.user.guild_permissions.manage_guild:
-        await interaction.response.send_message("❌ คุณไม่มีสิทธิ์ (ต้องมี Manage Server)", ephemeral=True)
+        await interaction.response.send_message("❌ ต้องมีสิทธิ์ Manage Server", ephemeral=True)
         return
+    
     config["setup_channel_id"] = channel.id
-    await interaction.response.send_message(f"✅ ตั้งห้องเซ็ตบอทเป็น {channel.mention}", ephemeral=True)
+    save_config()
+    await interaction.response.send_message(
+        f"✅ ตั้งห้องเซ็ตบอทเป็น {channel.mention}",
+        ephemeral=True
+    )
 
-# set auction channel (ห้องที่จะโพสต์ประมูลจริง)
-@tree.command(name="set_auction_channel", description="ตั้งห้องที่จะโพสต์ประมูลจริง")
-@app_commands.describe(channel="เลือกห้องสำหรับโพสต์ประมูล")
+@tree.command(name="set_auction_channel", description="ตั้งห้องประมูล")
+@app_commands.describe(channel="เลือกห้องประมูล")
 async def set_auction_channel(interaction: discord.Interaction, channel: discord.TextChannel):
     if not interaction.user.guild_permissions.manage_guild:
-        await interaction.response.send_message("❌ คุณไม่มีสิทธิ์ (ต้องมี Manage Server)", ephemeral=True)
+        await interaction.response.send_message("❌ ต้องมีสิทธิ์ Manage Server", ephemeral=True)
         return
+    
     config["auction_channel_id"] = channel.id
-    await interaction.response.send_message(f"✅ ตั้งห้องประมูลเป็น {channel.mention}", ephemeral=True)
+    save_config()
+    await interaction.response.send_message(
+        f"✅ ตั้งห้องประมูลเป็น {channel.mention}",
+        ephemeral=True
+    )
 
-# /ตกแต่ง (เปิด modal ในห้อง setup)
-@tree.command(name="ตกแต่ง", description="ตกแต่ง Embed ประมูล (ต้องรันในห้องเซ็ตบอท)")
+@tree.command(name="ตกแต่ง", description="ตั้งค่าประมูล (ข้อมูลพื้นฐาน)")
 async def decorate(interaction: discord.Interaction):
     if config["setup_channel_id"] and interaction.channel.id != config["setup_channel_id"]:
-        await interaction.response.send_message("❌ คำสั่งนี้ต้องรันในห้องเซ็ตบอทที่ตั้งไว้เท่านั้น", ephemeral=True)
+        await interaction.response.send_message(
+            "❌ ต้องใช้ในห้องเซ็ตบอทเท่านั้น",
+            ephemeral=True
+        )
         return
-    await interaction.response.send_modal(AuctionSetupModal())
+    
+    await interaction.response.send_modal(BasicInfoModal())
 
-# /เริ่มประมูล -> โพสต์ในห้อง auction (ใช้ draft)
-@tree.command(name="เริ่มประมูล", description="โพสต์ประมูลตามที่ตกแต่งไว้ ไปยังห้องประมูล")
+@tree.command(name="ตกแต่งเพิ่ม", description="เพิ่มรูปภาพและ footer")
+async def decorate_extra(interaction: discord.Interaction):
+    if config["setup_channel_id"] and interaction.channel.id != config["setup_channel_id"]:
+        await interaction.response.send_message(
+            "❌ ต้องใช้ในห้องเซ็ตบอทเท่านั้น",
+            ephemeral=True
+        )
+        return
+    
+    if not draft["title"]:
+        await interaction.response.send_message(
+            "❌ กรุณาใช้ `/ตกแต่ง` ก่อน",
+            ephemeral=True
+        )
+        return
+    
+    await interaction.response.send_modal(ImageModal())
+
+@tree.command(name="ดูตัวอย่าง", description="ดูตัวอย่าง Embed ประมูล")
+async def preview(interaction: discord.Interaction):
+    if not draft["title"]:
+        await interaction.response.send_message(
+            "❌ ยังไม่ได้ตั้งค่าประมูล ใช้ `/ตกแต่ง` ก่อน",
+            ephemeral=True
+        )
+        return
+    
+    await interaction.response.send_message(
+        embed=build_embed_preview(),
+        ephemeral=True
+    )
+
+@tree.command(name="เริ่มประมูล", description="โพสต์ประมูลในห้องประมูล")
 async def start_auction(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.manage_guild:
-        await interaction.response.send_message("❌ คุณไม่มีสิทธิ์เริ่มประมูล (ต้องมี Manage Server)", ephemeral=True)
+        await interaction.response.send_message("❌ ต้องมีสิทธิ์ Manage Server", ephemeral=True)
         return
+    
     if not config["auction_channel_id"]:
-        await interaction.response.send_message("❌ กรุณาตั้งห้องประมูลก่อนด้วย /set_auction_channel", ephemeral=True)
+        await interaction.response.send_message(
+            "❌ ยังไม่ได้ตั้งห้องประมูล ใช้ `/set_auction_channel` ก่อน",
+            ephemeral=True
+        )
         return
-    # ตรวจว่ามี draft สำคัญ
+    
     if not draft["title"] or not draft["description"] or not draft.get("end_time"):
-        await interaction.response.send_message("❌ ยังไม่ได้ตกแต่งหรือยังไม่ได้ตั้งเวลา กรุณาใช้ /ตกแต่ง ในห้องเซ็ตบอทก่อน", ephemeral=True)
+        await interaction.response.send_message(
+            "❌ ยังไม่ได้ตั้งค่าประมูลครบ ใช้ `/ตกแต่ง` ก่อน",
+            ephemeral=True
+        )
         return
-
+    
     channel = bot.get_channel(config["auction_channel_id"])
-    if not channel:
-        await interaction.response.send_message("❌ หา channel ไม่เจอ", ephemeral=True)
-        return
-
-    # สร้าง embed ตาม draft แต่เฉพาะข้อมูลที่จำเป็น (ในห้องประมูลจะมีแค่ปุ่มประมูล)
-    embed = discord.Embed(title=f"{draft['title']}", description=draft['description'], color=draft['color'])
-    if draft.get("thumbnail"): embed.set_thumbnail(url=draft["thumbnail"])
-    if draft.get("image"): embed.set_image(url=draft["image"])
-    if draft.get("footer"): embed.set_footer(text=draft["footer"])
-    embed.add_field(name="ราคานำ", value=f"{draft['min_bid']} โดย –", inline=False)
-    embed.add_field(name="เวลาสิ้นสุด", value=draft["end_time"].strftime("%Y-%m-%d %H:%M UTC"), inline=False)
-
-    msg = await channel.send(embed=embed, view=AuctionView(0))
+    
+    # Create embed
+    embed = discord.Embed(
+        title=draft["title"],
+        description=draft["description"],
+        color=draft["color"]
+    )
+    
+    if draft.get("thumbnail"):
+        embed.set_thumbnail(url=draft["thumbnail"])
+    if draft.get("image"):
+        embed.set_image(url=draft["image"])
+    if draft.get("footer"):
+        embed.set_footer(text=draft["footer"])
+    
+    embed.add_field(
+        name="💰 ราคานำ",
+        value=f"{draft['min_bid']:,} บาท (ยังไม่มีผู้เสนอ)",
+        inline=False
+    )
+    embed.add_field(
+        name="⏰ เวลาสิ้นสุด",
+        value=f"<t:{int(draft['end_time'].timestamp())}:F> (<t:{int(draft['end_time'].timestamp())}:R>)",
+        inline=False
+    )
+    
+    # Send message
+    msg = await channel.send(embed=embed, view=AuctionView())
+    
+    # Store auction data
     auctions[msg.id] = {
         "item": draft["title"],
         "highest_bid": draft["min_bid"],
         "highest_user": "-",
+        "highest_user_id": None,
         "min_bid": draft["min_bid"],
         "end_time": draft["end_time"],
         "channel_id": channel.id,
         "color": draft["color"]
     }
-    # update view with real message id
-    view = AuctionView(msg.id)
-    await msg.edit(view=view)
-
-    # start timer
+    save_auctions()
+    
+    # Start timer
     bot.loop.create_task(auction_timer(msg.id))
-    await interaction.response.send_message(f"✅ ประมูลถูกโพสต์ใน {channel.mention} เรียบร้อย!", ephemeral=True)
+    
+    await interaction.response.send_message(
+        f"✅ ประมูลโพสต์แล้วใน {channel.mention}\n"
+        f"สิ้นสุด: <t:{int(draft['end_time'].timestamp())}:R>",
+        ephemeral=True
+    )
 
-# convenience commands to set min_bid and time in config (optional)
-@tree.command(name="ขั้นต่ำ", description="ตั้งราคาประมูลขั้นต่ำ (สำหรับการตั้งก่อนสร้าง)")
-@app_commands.describe(amount="จำนวนเงิน (ตัวเลข)")
-async def cmd_set_min(interaction: discord.Interaction, amount: int):
-    if not interaction.user.guild_permissions.manage_guild:
-        await interaction.response.send_message("❌ คุณไม่มีสิทธิ์", ephemeral=True)
+# -------- Auction Timer --------
+async def auction_timer(msg_id):
+    """รอจนกว่าประมูลจะจบ แล้วประกาศผู้ชนะ"""
+    if msg_id not in auctions:
         return
-    config["min_bid"] = amount
-    draft["min_bid"] = amount
-    await interaction.response.send_message(f"✅ ตั้งขั้นต่ำเป็น {amount}", ephemeral=True)
-
-@tree.command(name="ตั้งเวลา", description="ตั้งเวลาเริ่มต้นสำหรับ draft (นาที) — ใช้ /ตกแต่ง เพื่อกำหนดเวลาจริง")
-@app_commands.describe(minutes="นาที")
-async def cmd_set_duration(interaction: discord.Interaction, minutes: int):
-    if not interaction.user.guild_permissions.manage_guild:
-        await interaction.response.send_message("❌ คุณไม่มีสิทธิ์", ephemeral=True)
-        return
-    config["auction_duration"] = minutes
-    await interaction.response.send_message(f"✅ ตั้ง default ระยะเวลาเป็น {minutes} นาที", ephemeral=True)
-
-# -----------------------
-# Auction timer
-# -----------------------
-async def auction_timer(message_id):
-    if message_id not in auctions:
-        return
-    auction = auctions[message_id]
-    now = datetime.utcnow()
-    remaining = (auction["end_time"] - now).total_seconds()
+    
+    auction = auctions[msg_id]
+    remaining = (auction["end_time"] - datetime.now(timezone.utc)).total_seconds()
+    
     if remaining > 0:
         await asyncio.sleep(remaining)
-    # announce winner
+    
+    # Get channel and announce winner
     channel = bot.get_channel(auction["channel_id"])
     if not channel:
         return
-    winner = auction.get("highest_user", "-")
-    amount = auction.get("highest_bid", 0)
-    await channel.send(f"⏰ ประมูลสินค้าจบแล้ว! ผู้ชนะคือ {winner} ด้วยราคา {amount} 💰")
-    # cleanup
+    
+    if auction["highest_user"] == "-":
+        await channel.send(
+            f"⏰ **ประมูล \"{auction['item']}\" จบแล้ว!**\n"
+            f"❌ ไม่มีผู้เสนอราคา"
+        )
+    else:
+        await channel.send(
+            f"🎉 **ประมูล \"{auction['item']}\" จบแล้ว!**\n"
+            f"🏆 ผู้ชนะ: {auction['highest_user']}\n"
+            f"💰 ราคา: **{auction['highest_bid']:,} บาท**"
+        )
+    
+    # Remove from active auctions
     try:
-        del auctions[message_id]
+        del auctions[msg_id]
+        save_auctions()
     except KeyError:
         pass
 
-# -----------------------
-# on_ready -> sync commands
-# -----------------------
+# -------- On Ready --------
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user}")
+    
+    # Load saved data
+    load_config()
+    load_auctions()
+    
+    # Add persistent view
+    bot.add_view(AuctionView())
+    
+    # Restart timers for active auctions
+    for msg_id, auction in list(auctions.items()):
+        if auction["end_time"] > datetime.now(timezone.utc):
+            bot.loop.create_task(auction_timer(msg_id))
+            print(f"♻️ Restarted timer for auction {msg_id}")
+        else:
+            # Already expired, clean up
+            del auctions[msg_id]
+    
+    save_auctions()
+    
+    # Sync commands
     try:
-        synced = await tree.sync()
-        print(f"Slash Commands synced ({len(synced)})")
+        synced = await bot.tree.sync()
+        print(f"✅ Synced {len(synced)} slash commands")
     except Exception as e:
-        print("Sync error:", e)
+        print(f"❌ Sync error: {e}")
 
-# -----------------------
-# run bot
-# -----------------------
+# -------- Run Bot --------
 if __name__ == "__main__":
     TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
     if not TOKEN:
-        print("Error: DISCORD_BOT_TOKEN env var missing")
+        print("❌ ไม่พบ DISCORD_BOT_TOKEN!")
+        print("ตั้งค่า environment variable ก่อนรันบอท")
     else:
         bot.run(TOKEN)
